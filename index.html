@@ -243,6 +243,10 @@
   .week .daycol.past { background-color: var(--surface-2); }
   .week .block { position: absolute; left: 3px; right: 3px; border-radius: 8px; padding: 5px 7px; font-size: 11.5px; line-height: 1.25; color: #fff; overflow: hidden; cursor: pointer; border: none; text-align: left; font-family: inherit; box-shadow: 0 2px 6px -2px rgba(0,0,0,.3); }
   .week .block.selected { outline: 2.5px solid var(--ink); outline-offset: 1px; }
+  .week .block { touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
+  .week .block.dragging { opacity: .92; z-index: 6; box-shadow: 0 12px 26px -6px rgba(0,0,0,.5); cursor: grabbing; }
+  .week .daycol.drop-target { background-color: color-mix(in srgb, var(--tertiary) 12%, var(--surface)) !important; }
+  .drag-time { position: fixed; z-index: 50; background: var(--ink); color: var(--paper); font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px; pointer-events: none; white-space: nowrap; }
   .week .block .bl { font-weight: 700; }
   .week .block .bt { opacity: .88; font-size: 10.5px; }
   .week .block .bn { font-style: italic; opacity: .9; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -371,6 +375,9 @@
   .trash-item .meta { flex: 1; color: var(--ink-soft); font-size: 12px; }
   .confirm-box { background: color-mix(in srgb, var(--primary) 8%, var(--surface)); border: 1.5px solid color-mix(in srgb, var(--primary) 35%, var(--line)); border-radius: var(--r-sm); padding: 12px 14px; margin-top: 10px; }
   .confirm-box input[type=text] { margin-top: 8px; width: 160px; }
+  .sync-pill { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; margin-left: 10px; font-size: 12px; opacity: .92; background: rgba(255,255,255,.18); padding: 4px 10px; border-radius: 999px; }
+  .sync-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #fff; opacity: .5; }
+  .sync-pill .dot.ok { background: #7CFFB2; opacity: 1; } .sync-pill .dot.warn { background: #FFD166; opacity: 1; } .sync-pill .dot.err { background: #FF6B6B; opacity: 1; }
   .sync-conflict { margin-bottom: 16px; border-color: color-mix(in srgb, var(--tertiary) 40%, var(--line)); background: color-mix(in srgb, var(--tertiary) 6%, var(--surface)); }
   .sync-conflict-body { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px 16px; flex-wrap: wrap; }
   .sync-conflict-actions { display: flex; gap: 8px; flex-shrink: 0; }
@@ -592,15 +599,22 @@
     diskTimer = setTimeout(writeDiskBackup, 2500);
   }
 
-  /* ---------- synchronisation cloud (Firebase, multi-appareils) ---------- */
+  /* ---------- synchronisation cloud (Firebase, multi-appareils, temps réel) ---------- */
   const SYNC_CONFIG_KEY = 'carnet_pass_sync_config';
+  const LAST_SYNC_KEY = 'carnet_pass_last_sync';     // updatedAt (cloud) du dernier état appliqué ou envoyé
+  const SYNC_DIRTY_KEY = 'carnet_pass_sync_dirty';   // "1" = modifications locales pas encore envoyées
+  const DEVICE_ID_KEY = 'carnet_pass_device_id';
   const LOCAL_UPDATED_KEY = 'carnet_pass_local_updated';
-  const LAST_SYNC_KEY = 'carnet_pass_last_sync';
-  let fbApp = null, fbAuth = null, fbDb = null, fbScriptsLoaded = false, cloudTimer = null;
+  let fbApp = null, fbAuth = null, fbDb = null, fbScriptsLoaded = false, cloudTimer = null, cloudUnsub = null, syncApplying = false;
+  function deviceId() { let d = localStorage.getItem(DEVICE_ID_KEY); if (!d) { d = uid(); localStorage.setItem(DEVICE_ID_KEY, d); } return d; }
+  function deviceName() { const ua = navigator.userAgent; if (/iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return 'iPad'; if (/iPhone/.test(ua)) return 'iPhone'; if (/Android/.test(ua)) return 'Android'; if (/Windows/.test(ua)) return 'PC Windows'; if (/Macintosh/.test(ua)) return 'Mac'; return 'appareil'; }
+  function isDirty() { return localStorage.getItem(SYNC_DIRTY_KEY) === '1'; }
+  function setDirty(v) { localStorage.setItem(SYNC_DIRTY_KEY, v ? '1' : '0'); }
+  function lastSync() { return parseInt(localStorage.getItem(LAST_SYNC_KEY) || '0', 10); }
 
   function loadSyncConfig() { return loadJSON(SYNC_CONFIG_KEY, null); }
   function saveSyncConfigData(cfg) { saveJSON(SYNC_CONFIG_KEY, cfg); }
-  function clearSyncConfigData() { localStorage.removeItem(SYNC_CONFIG_KEY); localStorage.removeItem(LAST_SYNC_KEY); localStorage.removeItem(LOCAL_UPDATED_KEY); }
+  function clearSyncConfigData() { localStorage.removeItem(SYNC_CONFIG_KEY); localStorage.removeItem(LAST_SYNC_KEY); localStorage.removeItem(SYNC_DIRTY_KEY); }
 
   function loadFirebaseScripts() {
     if (fbScriptsLoaded) return Promise.resolve();
@@ -611,7 +625,7 @@
     ];
     return urls.reduce((p, u) => p.then(() => new Promise((res, rej) => {
       const s = document.createElement('script'); s.src = u;
-      s.onload = res; s.onerror = () => rej(new Error('Impossible de charger ' + u));
+      s.onload = res; s.onerror = () => rej(new Error('Impossible de charger les scripts Firebase (connexion internet ?)'));
       document.head.appendChild(s);
     })), Promise.resolve()).then(() => { fbScriptsLoaded = true; });
   }
@@ -620,7 +634,6 @@
       if (!fbApp) { fbApp = window.firebase.initializeApp(cfg); fbAuth = window.firebase.auth(); fbDb = window.firebase.firestore(); }
     });
   }
-  // Accepte soit un bloc JS collé depuis la console Firebase (const firebaseConfig = {...}), soit du JSON.
   function parseFirebaseConfigBlock(text) {
     const m = text.match(/\{[\s\S]*\}/);
     if (!m) return null;
@@ -637,61 +650,98 @@
     'auth/wrong-password': 'Mot de passe incorrect.',
     'auth/user-not-found': 'Aucun compte avec cet e-mail — crée-en un d\'abord.',
     'auth/invalid-credential': 'E-mail ou mot de passe incorrect.',
-    'auth/unauthorized-domain': 'Ce site n\'est pas autorisé dans Firebase. Ajoute son adresse dans Authentication → Settings → Authorized domains.',
+    'auth/unauthorized-domain': 'Ce site n\'est pas autorisé dans Firebase : ajoute son adresse dans Authentication → Settings → Authorized domains.',
     'auth/network-request-failed': 'Problème de connexion internet.',
-    'permission-denied': 'Accès refusé par les règles de sécurité Firestore. Vérifie qu\'elles correspondent bien à ce qui est demandé dans le guide.'
+    'auth/operation-not-allowed': 'La connexion par e-mail n\'est pas activée dans Firebase (Authentication → Sign-in method → Email/Password).',
+    'permission-denied': 'Accès refusé par Firestore : vérifie les règles de sécurité (étape 5 du guide).',
+    'unavailable': 'Firestore injoignable (connexion internet ?).'
   };
   function fbErrorMessage(err) { return (err && FB_ERRORS[err.code]) || (err && err.message) || 'Erreur inconnue.'; }
+  function setSyncError(err) { state.syncStatus = 'error'; state.syncError = fbErrorMessage(err); }
 
   function syncSignUp(email, pass) { return initFirebase(state.syncConfig).then(() => fbAuth.createUserWithEmailAndPassword(email, pass)); }
   function syncSignIn(email, pass) { return initFirebase(state.syncConfig).then(() => fbAuth.signInWithEmailAndPassword(email, pass)); }
-  function syncSignOut() { return fbAuth ? fbAuth.signOut() : Promise.resolve(); }
-
+  function syncSignOut() { stopCloudListener(); return fbAuth ? fbAuth.signOut() : Promise.resolve(); }
   function cloudDocRef() { return fbDb.collection('users').doc(fbAuth.currentUser.uid).collection('carnet').doc('data'); }
+
+  // Est-ce que ce carnet n'a encore rien de réel (matières d'exemple, aucun cours/créneau/concours) ?
+  function localIsEmpty() {
+    if (everyChapter().length || state.exams.length || loadRecurring().length) return false;
+    if (Object.keys(localStorage).some(k => k.startsWith(CALENDAR_PREFIX) || k.startsWith(CHECKLIST_PREFIX))) return false;
+    return true;
+  }
+
   function cloudPush() {
     if (!fbAuth || !fbAuth.currentUser) return Promise.resolve();
+    clearTimeout(cloudTimer);
     const updatedAt = Date.now();
-    return cloudDocRef().set({ json: JSON.stringify(fullExportData()), updatedAt, device: (navigator.userAgent.match(/iPad|iPhone|Android|Mac|Windows|Linux/) || ['appareil'])[0] })
-      .then(() => { localStorage.setItem(LOCAL_UPDATED_KEY, String(updatedAt)); localStorage.setItem(LAST_SYNC_KEY, String(updatedAt)); state.syncStatus = 'synced'; state.syncError = ''; });
+    state.syncStatus = 'syncing';
+    return cloudDocRef().set({ json: JSON.stringify(fullExportData()), updatedAt, deviceId: deviceId(), device: deviceName() })
+      .then(() => { setDirty(false); localStorage.setItem(LAST_SYNC_KEY, String(updatedAt)); state.syncStatus = 'synced'; state.syncError = ''; state.syncLastAt = updatedAt; })
+      .catch(err => { setSyncError(err); throw err; });
   }
-  function cloudPull() { return cloudDocRef().get().then(doc => doc.exists ? doc.data() : null); }
   function queueCloudSync() {
     localStorage.setItem(LOCAL_UPDATED_KEY, String(Date.now()));
+    if (syncApplying) return;
+    if (state.syncConfig) setDirty(true);
     if (!state.syncConfig || !fbAuth || !fbAuth.currentUser || state.syncConflict) return;
     clearTimeout(cloudTimer);
-    cloudTimer = setTimeout(() => { state.syncStatus = 'syncing'; cloudPush().catch(err => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(err); }); }, 3000);
+    cloudTimer = setTimeout(() => { cloudPush().then(() => renderSyncIndicator()).catch(() => renderSyncIndicator()); }, 1500);
   }
-  // Au démarrage / connexion : ne remplace JAMAIS les données locales sans confirmation explicite.
-  function checkCloudOnStart() {
+  function flushCloudSync() { if (state.syncConfig && fbAuth && fbAuth.currentUser && isDirty() && !state.syncConflict) cloudPush().catch(() => {}); }
+
+  function applyCloud(cloud) {
+    syncApplying = true;
+    try {
+      applyImportedData(JSON.parse(cloud.json));
+      state.exams = loadExams();
+    } finally { syncApplying = false; }
+    setDirty(false); localStorage.setItem(LAST_SYNC_KEY, String(cloud.updatedAt));
+    state.syncConflict = null; state.syncStatus = 'synced'; state.syncError = ''; state.syncLastAt = cloud.updatedAt;
+    closeTransient(); render();
+  }
+  // Reçoit chaque nouvelle version du cloud (au démarrage puis en direct).
+  function handleCloudDoc(cloud) {
+    // "Appareil neuf" ne s'applique qu'à la toute première réponse reçue juste après la connexion :
+    // au-delà, même si le carnet local semble vide, on ne bascule plus jamais sans confirmation.
+    const fresh = state.syncFreshDevice; state.syncFreshDevice = false;
+    if (!cloud) { cloudPush().then(render).catch(render); return; }               // rien dans le cloud : on envoie ce qu'on a
+    if (cloud.deviceId === deviceId()) { localStorage.setItem(LAST_SYNC_KEY, String(cloud.updatedAt)); state.syncStatus = 'synced'; state.syncLastAt = cloud.updatedAt; renderSyncIndicator(); return; } // écho de notre propre envoi
+    if (cloud.updatedAt <= lastSync()) { state.syncStatus = 'synced'; renderSyncIndicator(); return; }             // déjà appliqué
+    if (!isDirty() || (fresh && localIsEmpty())) { applyCloud(cloud); if (!fresh) toast('Mis à jour depuis ' + (cloud.device || 'l\'autre appareil')); return; }
+    // vrai conflit : modifications locales non envoyées ET nouvelle version ailleurs
+    state.syncConflict = cloud; state.syncStatus = 'conflict'; render();
+  }
+  function startCloudListener() {
+    stopCloudListener();
     state.syncStatus = 'syncing';
-    return cloudPull().then(cloud => {
-      if (!cloud) { return cloudPush(); }
-      const localUpdated = parseInt(localStorage.getItem(LOCAL_UPDATED_KEY) || '0', 10);
-      const lastSync = parseInt(localStorage.getItem(LAST_SYNC_KEY) || '0', 10);
-      if (cloud.updatedAt > lastSync && cloud.updatedAt > localUpdated) {
-        state.syncConflict = cloud; state.syncStatus = 'conflict';
-      } else if (localUpdated > cloud.updatedAt) {
-        return cloudPush();
-      } else {
-        state.syncStatus = 'synced'; localStorage.setItem(LAST_SYNC_KEY, String(cloud.updatedAt));
-      }
-    }).catch(err => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(err); });
+    state.syncFreshDevice = localIsEmpty();
+    cloudUnsub = cloudDocRef().onSnapshot(doc => {
+      if (doc.metadata && doc.metadata.hasPendingWrites) return;
+      handleCloudDoc(doc.exists ? doc.data() : null);
+    }, err => { setSyncError(err); render(); });
   }
+  function stopCloudListener() { if (cloudUnsub) { try { cloudUnsub(); } catch (e) {} cloudUnsub = null; } }
   function resolveConflictLoad() {
     const cloud = state.syncConflict; if (!cloud) return Promise.resolve();
-    return snapshotNow('avant synchro cloud').then(() => {
-      applyImportedData(JSON.parse(cloud.json));
-      localStorage.setItem(LOCAL_UPDATED_KEY, String(cloud.updatedAt)); localStorage.setItem(LAST_SYNC_KEY, String(cloud.updatedAt));
-      state.syncConflict = null; state.syncStatus = 'synced';
-    });
+    return snapshotNow('avant synchro cloud').then(() => applyCloud(cloud));
   }
-  function resolveConflictKeep() { state.syncConflict = null; state.syncStatus = 'syncing'; return cloudPush().catch(err => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(err); }); }
+  function resolveConflictKeep() { state.syncConflict = null; setDirty(true); return cloudPush().then(render).catch(render); }
   function onSyncAuthChange(user) {
-    if (user) {
-      state.syncUser = user.email; state.syncStatus = 'syncing'; render();
-      checkCloudOnStart().then(() => render());
-    } else { state.syncUser = null; state.syncStatus = 'signed-out'; render(); }
+    if (user) { state.syncUser = user.email; startCloudListener(); render(); }
+    else { stopCloudListener(); state.syncUser = null; state.syncStatus = 'signed-out'; render(); }
   }
+  function syncIndicatorHtml() {
+    if (!state.syncConfig) return '';
+    const S = state.syncStatus;
+    let cls = 'off', txt = 'non connecté';
+    if (S === 'synced') { cls = 'ok'; txt = 'synchronisé' + (state.syncLastAt ? ' · ' + new Date(state.syncLastAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : ''); }
+    else if (S === 'syncing') { cls = 'warn'; txt = 'synchronisation…'; }
+    else if (S === 'conflict') { cls = 'warn'; txt = 'décision en attente'; }
+    else if (S === 'error') { cls = 'err'; txt = 'erreur de synchro'; }
+    return '<div class="sync-pill" id="sync-indicator" title="' + h(state.syncError || '') + '"><span class="dot ' + cls + '"></span>' + txt + '</div>';
+  }
+  function renderSyncIndicator() { const el = document.getElementById('sync-indicator'); if (el) el.outerHTML = syncIndicatorHtml(); }
 
   const PALETTE = ['#FF4F5E', '#12B886', '#5C5CFF', '#FF9F1C', '#0EA5E9', '#E040A0', '#00C2A8', '#8E44FF', '#F5B700', '#FF6B35', '#2DD4BF', '#7C3AED'];
   const DEFAULT_CATEGORIES = [
@@ -739,7 +789,7 @@
     backups: [], fsStatus: 'unknown', resetConfirmOpen: false,
     exams: [], examNewForm: false, examAddEntry: null, examEditEntry: null, examRenaming: null,
     syncConfig: null, syncStatus: 'unconfigured', syncUser: null, syncConflict: null, syncError: '',
-    syncFormOpen: false, syncAuthMode: 'signup', syncEmail: '', syncPending: false
+    syncFormOpen: false, syncAuthMode: 'signup', syncEmail: '', syncPending: false, syncLastAt: 0, syncFreshDevice: false
   };
 
   /* ---------- dates ---------- */
@@ -972,7 +1022,7 @@
     html += '<div><div class="date cap">' + fmtDateLong(state.dateStr) + '</div><h1>Carnet PASS</h1>';
     html += '<div class="sem-switch" style="margin-top:12px;"><button data-sem="all" class="' + (S.activeSemester === 'all' ? 'active' : '') + '">Tout</button>';
     S.semesters.forEach(s => html += '<button data-sem="' + s.id + '" class="' + (S.activeSemester === s.id ? 'active' : '') + '">' + h(s.name) + '</button>');
-    html += '</div></div>';
+    html += '</div>' + syncIndicatorHtml() + '</div>';
     html += '<div class="hero-stats">';
     html += '<div class="stat"><div class="n num">' + due + '</div><div class="l">révision' + (due > 1 ? 's' : '') + ' due' + (due > 1 ? 's' : '') + '</div></div>';
     html += '<div class="stat"><div class="n num">' + todo + '</div><div class="l">à étudier</div></div>';
@@ -1177,6 +1227,28 @@
   }
 
   /* ---- week ---- */
+  const HOUR_PX = 44;
+  let dragJustHappened = false;
+  function toTime(m) { return pad(Math.floor(m / 60)) + ':' + pad(m % 60); }
+  // Déplace un créneau (ou une occurrence d'une série, qui devient alors indépendante) vers un autre jour / une autre heure.
+  function moveBlock(fromDate, id, toDate, newStart) {
+    let b;
+    if (id.startsWith('rec_')) {
+      const rules = loadRecurring(); const r = rules.find(x => x.id === id.slice(4)); if (!r) return false;
+      r.skip = (r.skip || []).concat([fromDate]); saveRecurring(rules);
+      b = { id: uid(), label: r.label, start: r.start, end: r.end, category: r.category, subjectId: r.subjectId || '', note: r.note || '', fileId: r.fileId || '', color: r.color || '' };
+    } else {
+      const blocks = loadBlocks(fromDate); b = blocks.find(x => x.id === id); if (!b) return false;
+      saveBlocks(fromDate, blocks.filter(x => x !== b));
+    }
+    const dur = minutesFromTime(b.end) - minutesFromTime(b.start);
+    if (newStart !== null && newStart !== undefined) {
+      const s = Math.max(state.settings.dayStart * 60, Math.min(newStart, state.settings.dayEnd * 60 - dur));
+      b.start = toTime(s); b.end = toTime(s + dur);
+    }
+    const dest = loadBlocks(toDate); dest.push(b); saveBlocks(toDate, dest);
+    return true;
+  }
   function blockColor(b) {
     if (b.fac) return 'var(--secondary)';
     if (b.color) return b.color;
@@ -1190,7 +1262,6 @@
     const S = state.settings;
     const start = state.weekStart;
     const days = []; for (let i = 0; i < 7; i++) days.push(addDays(start, i));
-    const HOUR_PX = 44;
     const totalH = (S.dayEnd - S.dayStart) * HOUR_PX;
     const today = todayStr();
     const isThisWeek = mondayOf(today) === start;
@@ -1319,7 +1390,7 @@
       }
       html += '</div></div></div>';
     } else {
-      html += '<p class="small faint" style="margin-top:10px;">Clique sur une case vide pour ajouter un créneau à cette heure, ou sur un créneau pour le modifier. Les créneaux ↻ se répètent automatiquement.</p>';
+      html += '<p class="small faint" style="margin-top:10px;">Clique sur une case vide pour ajouter un créneau, sur un créneau pour le modifier. <b>Glisse un créneau</b> pour le déplacer vers un autre jour ou une autre heure (sur écran tactile : maintiens le doigt appuyé puis glisse). Les créneaux ↻ se répètent automatiquement.</p>';
     }
     return html;
   }
@@ -2202,9 +2273,10 @@
     on('[data-week-today]', 'click', () => { state.weekStart = mondayOf(todayStr()); render(); });
     on('[data-new-block]', 'click', el => { state.editingBlock = { date: el.getAttribute('data-new-block'), id: null }; render(); scrollToForm(); });
     on('[data-block]', 'click', (el, e) => {
-      e.stopPropagation(); const [date, id] = el.getAttribute('data-block').split(':');
+      e.stopPropagation(); if (dragJustHappened) return; const [date, id] = el.getAttribute('data-block').split(':');
       state.editingBlock = id.startsWith('rec_') ? { date, id, recId: id.slice(4) } : { date, id }; render(); scrollToForm();
     });
+    root.querySelectorAll('.week .block[data-block]').forEach(bl => bl.addEventListener('pointerdown', e => startBlockDrag(e, bl)));
     on('[data-daycol]', 'click', (el, e) => {
       if (e.target !== el) return;
       const rect = el.getBoundingClientRect();
@@ -2402,11 +2474,11 @@
     on('[data-sync-signout]', 'click', () => { syncSignOut().then(() => { state.syncUser = null; state.syncStatus = 'signed-out'; render(); toast('Déconnecté'); }); });
     on('[data-sync-forget]', 'click', () => {
       if (!confirm('Désactiver la synchronisation sur cet appareil ? Tes données restent intactes ici et dans le cloud — tu pourras te reconnecter plus tard.')) return;
-      if (fbAuth) fbAuth.signOut().catch(() => {});
+      stopCloudListener(); if (fbAuth) fbAuth.signOut().catch(() => {});
       clearSyncConfigData(); state.syncConfig = null; state.syncUser = null; state.syncStatus = 'unconfigured'; state.syncFormOpen = false; render();
     });
-    on('[data-sync-now]', 'click', () => { state.syncStatus = 'syncing'; render(); cloudPush().then(() => { render(); toast('Synchronisé'); }).catch(e => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(e); render(); }); });
-    on('[data-sync-load]', 'click', () => { resolveConflictLoad().then(() => { render(); toast('Données du cloud chargées'); }); });
+    on('[data-sync-now]', 'click', () => { setDirty(true); render(); cloudPush().then(() => { render(); toast('Synchronisé'); }).catch(() => render()); });
+    on('[data-sync-load]', 'click', () => { resolveConflictLoad().then(() => toast('Données du cloud chargées')); });
     on('[data-sync-keep]', 'click', () => { resolveConflictKeep().then(() => { render(); toast('Tes données locales ont été gardées et envoyées au cloud'); }); });
     const icsInput = root.querySelector('#ics-file');
     if (icsInput) icsInput.addEventListener('change', () => {
@@ -2524,6 +2596,57 @@
 
   }
 
+  function startBlockDrag(e, bl) {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (e.target.closest('.doc-mark')) return;
+    const isTouch = e.pointerType === 'touch' || e.pointerType === 'pen';
+    const [fromDate, id] = bl.getAttribute('data-block').split(':');
+    const b = dayBlocks(fromDate).find(x => x.id === id); if (!b) return;
+    const dur = minutesFromTime(b.end) - minutesFromTime(b.start);
+    const startX = e.clientX, startY = e.clientY, pointerId = e.pointerId;
+    const rect = bl.getBoundingClientRect(); const offsetY = startY - rect.top;
+    const cols = Array.from(root.querySelectorAll('[data-daycol]'));
+    const ghost = document.createElement('div'); ghost.className = 'drag-time';
+    let active = false, moved = false, timer = null;
+    const clampStart = m => Math.max(state.settings.dayStart * 60, Math.min(m, state.settings.dayEnd * 60 - dur));
+    const activate = () => { active = true; bl.classList.add('dragging'); try { bl.setPointerCapture(pointerId); } catch (_) {} document.body.appendChild(ghost); };
+    const target = (x, y) => {
+      const col = cols.find(c => { const r = c.getBoundingClientRect(); return x >= r.left && x < r.right; });
+      if (!col) return null;
+      const yTop = y - offsetY - col.getBoundingClientRect().top;
+      const mins = clampStart(state.settings.dayStart * 60 + Math.round(yTop / HOUR_PX * 60 / 15) * 15);
+      return { col, date: col.getAttribute('data-daycol'), mins };
+    };
+    const cleanup = () => {
+      clearTimeout(timer); active = false; bl.classList.remove('dragging'); bl.style.transform = '';
+      cols.forEach(c => c.classList.remove('drop-target')); ghost.remove();
+      document.removeEventListener('pointermove', onMove); document.removeEventListener('pointerup', onUp); document.removeEventListener('pointercancel', cleanup);
+      try { bl.releasePointerCapture(pointerId); } catch (_) {}
+    };
+    const onMove = ev => {
+      const dist = Math.hypot(ev.clientX - startX, ev.clientY - startY);
+      if (!active) { if (dist > 8) cleanup(); return; }
+      ev.preventDefault();
+      if (dist > 4) moved = true;
+      const t = target(ev.clientX, ev.clientY);
+      cols.forEach(c => c.classList.toggle('drop-target', !!t && c === t.col));
+      bl.style.transform = 'translate(' + (ev.clientX - startX) + 'px,' + (ev.clientY - startY) + 'px) scale(1.03)';
+      if (t) { ghost.textContent = DAY_NAMES[weekdayIdx(t.date)] + ' ' + parse(t.date).getDate() + ' · ' + toTime(t.mins) + '–' + toTime(t.mins + dur); ghost.style.left = (ev.clientX + 14) + 'px'; ghost.style.top = (ev.clientY - 32) + 'px'; }
+    };
+    const onUp = ev => {
+      const t = (active && moved) ? target(ev.clientX, ev.clientY) : null;
+      cleanup();
+      if (!t) return;
+      dragJustHappened = true; setTimeout(() => { dragJustHappened = false; }, 350);
+      if (t.date === fromDate && toTime(t.mins) === b.start) return;
+      moveBlock(fromDate, id, t.date, t.mins);
+      state.editingBlock = null; render();
+      toast('Déplacé au ' + fmtDateShort(t.date) + ' à ' + toTime(t.mins) + (id.startsWith('rec_') ? ' (détaché de la série)' : ''));
+    };
+    document.addEventListener('pointermove', onMove, { passive: false }); document.addEventListener('pointerup', onUp); document.addEventListener('pointercancel', cleanup);
+    if (isTouch) timer = setTimeout(activate, 350); else activate();
+  }
+
   function autoGrow(el) { el.style.height = 'auto'; el.style.height = Math.max(36, el.scrollHeight) + 'px'; }
   function scrollToForm() { const f = root.querySelector('.block-form'); if (f) f.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); const l = root.querySelector('#bf-label'); if (l && !l.value) l.focus(); }
 
@@ -2533,6 +2656,12 @@
     state.checklist = loadJSON(CHECKLIST_PREFIX + state.dateStr, []);
     state.exams = loadExams();
     state.syncConfig = loadSyncConfig();
+    if (!window.__carnetSyncHooks) {
+      window.__carnetSyncHooks = true;
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { clearTimeout(cloudTimer); flushCloudSync(); } });
+      window.addEventListener('pagehide', () => { clearTimeout(cloudTimer); flushCloudSync(); });
+      window.addEventListener('online', () => flushCloudSync());
+    }
     if (state.syncConfig) {
       initFirebase(state.syncConfig).then(() => {
         fbAuth.onAuthStateChanged(user => onSyncAuthChange(user));
