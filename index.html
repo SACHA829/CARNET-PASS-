@@ -371,6 +371,9 @@
   .trash-item .meta { flex: 1; color: var(--ink-soft); font-size: 12px; }
   .confirm-box { background: color-mix(in srgb, var(--primary) 8%, var(--surface)); border: 1.5px solid color-mix(in srgb, var(--primary) 35%, var(--line)); border-radius: var(--r-sm); padding: 12px 14px; margin-top: 10px; }
   .confirm-box input[type=text] { margin-top: 8px; width: 160px; }
+  .sync-conflict { margin-bottom: 16px; border-color: color-mix(in srgb, var(--tertiary) 40%, var(--line)); background: color-mix(in srgb, var(--tertiary) 6%, var(--surface)); }
+  .sync-conflict-body { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px 16px; flex-wrap: wrap; }
+  .sync-conflict-actions { display: flex; gap: 8px; flex-shrink: 0; }
   .cat-colors { display: flex; flex-direction: column; gap: 8px; }
   .cat-colors .row2 { display: flex; align-items: center; gap: 10px; }
   .cat-colors .row2 .lbl { flex: 1; font-size: 13px; }
@@ -589,6 +592,107 @@
     diskTimer = setTimeout(writeDiskBackup, 2500);
   }
 
+  /* ---------- synchronisation cloud (Firebase, multi-appareils) ---------- */
+  const SYNC_CONFIG_KEY = 'carnet_pass_sync_config';
+  const LOCAL_UPDATED_KEY = 'carnet_pass_local_updated';
+  const LAST_SYNC_KEY = 'carnet_pass_last_sync';
+  let fbApp = null, fbAuth = null, fbDb = null, fbScriptsLoaded = false, cloudTimer = null;
+
+  function loadSyncConfig() { return loadJSON(SYNC_CONFIG_KEY, null); }
+  function saveSyncConfigData(cfg) { saveJSON(SYNC_CONFIG_KEY, cfg); }
+  function clearSyncConfigData() { localStorage.removeItem(SYNC_CONFIG_KEY); localStorage.removeItem(LAST_SYNC_KEY); localStorage.removeItem(LOCAL_UPDATED_KEY); }
+
+  function loadFirebaseScripts() {
+    if (fbScriptsLoaded) return Promise.resolve();
+    const urls = [
+      'https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js',
+      'https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js',
+      'https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js'
+    ];
+    return urls.reduce((p, u) => p.then(() => new Promise((res, rej) => {
+      const s = document.createElement('script'); s.src = u;
+      s.onload = res; s.onerror = () => rej(new Error('Impossible de charger ' + u));
+      document.head.appendChild(s);
+    })), Promise.resolve()).then(() => { fbScriptsLoaded = true; });
+  }
+  function initFirebase(cfg) {
+    return loadFirebaseScripts().then(() => {
+      if (!fbApp) { fbApp = window.firebase.initializeApp(cfg); fbAuth = window.firebase.auth(); fbDb = window.firebase.firestore(); }
+    });
+  }
+  // Accepte soit un bloc JS collé depuis la console Firebase (const firebaseConfig = {...}), soit du JSON.
+  function parseFirebaseConfigBlock(text) {
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    try {
+      const obj = Function('"use strict"; return (' + m[0] + ');')();
+      if (obj && obj.apiKey && obj.projectId && obj.authDomain) return { apiKey: obj.apiKey, authDomain: obj.authDomain, projectId: obj.projectId, storageBucket: obj.storageBucket || '', messagingSenderId: obj.messagingSenderId || '', appId: obj.appId || '' };
+      return null;
+    } catch (e) { return null; }
+  }
+  const FB_ERRORS = {
+    'auth/email-already-in-use': 'Un compte existe déjà avec cet e-mail — connecte-toi plutôt.',
+    'auth/invalid-email': 'Adresse e-mail invalide.',
+    'auth/weak-password': 'Le mot de passe doit faire au moins 6 caractères.',
+    'auth/wrong-password': 'Mot de passe incorrect.',
+    'auth/user-not-found': 'Aucun compte avec cet e-mail — crée-en un d\'abord.',
+    'auth/invalid-credential': 'E-mail ou mot de passe incorrect.',
+    'auth/unauthorized-domain': 'Ce site n\'est pas autorisé dans Firebase. Ajoute son adresse dans Authentication → Settings → Authorized domains.',
+    'auth/network-request-failed': 'Problème de connexion internet.',
+    'permission-denied': 'Accès refusé par les règles de sécurité Firestore. Vérifie qu\'elles correspondent bien à ce qui est demandé dans le guide.'
+  };
+  function fbErrorMessage(err) { return (err && FB_ERRORS[err.code]) || (err && err.message) || 'Erreur inconnue.'; }
+
+  function syncSignUp(email, pass) { return initFirebase(state.syncConfig).then(() => fbAuth.createUserWithEmailAndPassword(email, pass)); }
+  function syncSignIn(email, pass) { return initFirebase(state.syncConfig).then(() => fbAuth.signInWithEmailAndPassword(email, pass)); }
+  function syncSignOut() { return fbAuth ? fbAuth.signOut() : Promise.resolve(); }
+
+  function cloudDocRef() { return fbDb.collection('users').doc(fbAuth.currentUser.uid).collection('carnet').doc('data'); }
+  function cloudPush() {
+    if (!fbAuth || !fbAuth.currentUser) return Promise.resolve();
+    const updatedAt = Date.now();
+    return cloudDocRef().set({ json: JSON.stringify(fullExportData()), updatedAt, device: (navigator.userAgent.match(/iPad|iPhone|Android|Mac|Windows|Linux/) || ['appareil'])[0] })
+      .then(() => { localStorage.setItem(LOCAL_UPDATED_KEY, String(updatedAt)); localStorage.setItem(LAST_SYNC_KEY, String(updatedAt)); state.syncStatus = 'synced'; state.syncError = ''; });
+  }
+  function cloudPull() { return cloudDocRef().get().then(doc => doc.exists ? doc.data() : null); }
+  function queueCloudSync() {
+    localStorage.setItem(LOCAL_UPDATED_KEY, String(Date.now()));
+    if (!state.syncConfig || !fbAuth || !fbAuth.currentUser || state.syncConflict) return;
+    clearTimeout(cloudTimer);
+    cloudTimer = setTimeout(() => { state.syncStatus = 'syncing'; cloudPush().catch(err => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(err); }); }, 3000);
+  }
+  // Au démarrage / connexion : ne remplace JAMAIS les données locales sans confirmation explicite.
+  function checkCloudOnStart() {
+    state.syncStatus = 'syncing';
+    return cloudPull().then(cloud => {
+      if (!cloud) { return cloudPush(); }
+      const localUpdated = parseInt(localStorage.getItem(LOCAL_UPDATED_KEY) || '0', 10);
+      const lastSync = parseInt(localStorage.getItem(LAST_SYNC_KEY) || '0', 10);
+      if (cloud.updatedAt > lastSync && cloud.updatedAt > localUpdated) {
+        state.syncConflict = cloud; state.syncStatus = 'conflict';
+      } else if (localUpdated > cloud.updatedAt) {
+        return cloudPush();
+      } else {
+        state.syncStatus = 'synced'; localStorage.setItem(LAST_SYNC_KEY, String(cloud.updatedAt));
+      }
+    }).catch(err => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(err); });
+  }
+  function resolveConflictLoad() {
+    const cloud = state.syncConflict; if (!cloud) return Promise.resolve();
+    return snapshotNow('avant synchro cloud').then(() => {
+      applyImportedData(JSON.parse(cloud.json));
+      localStorage.setItem(LOCAL_UPDATED_KEY, String(cloud.updatedAt)); localStorage.setItem(LAST_SYNC_KEY, String(cloud.updatedAt));
+      state.syncConflict = null; state.syncStatus = 'synced';
+    });
+  }
+  function resolveConflictKeep() { state.syncConflict = null; state.syncStatus = 'syncing'; return cloudPush().catch(err => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(err); }); }
+  function onSyncAuthChange(user) {
+    if (user) {
+      state.syncUser = user.email; state.syncStatus = 'syncing'; render();
+      checkCloudOnStart().then(() => render());
+    } else { state.syncUser = null; state.syncStatus = 'signed-out'; render(); }
+  }
+
   const PALETTE = ['#FF4F5E', '#12B886', '#5C5CFF', '#FF9F1C', '#0EA5E9', '#E040A0', '#00C2A8', '#8E44FF', '#F5B700', '#FF6B35', '#2DD4BF', '#7C3AED'];
   const DEFAULT_CATEGORIES = [
     { id: 'travail', label: 'Travail', color: '#3D3A5C' },
@@ -633,7 +737,9 @@
     lib: { folders: [], files: [], folderId: null, newFolder: false, renameFolder: null, renameFile: null, search: '', dropTarget: null },
     papers: { files: [], cat: 'all', search: '', renameFile: null, newNote: false },
     backups: [], fsStatus: 'unknown', resetConfirmOpen: false,
-    exams: [], examNewForm: false, examAddEntry: null, examEditEntry: null, examRenaming: null
+    exams: [], examNewForm: false, examAddEntry: null, examEditEntry: null, examRenaming: null,
+    syncConfig: null, syncStatus: 'unconfigured', syncUser: null, syncConflict: null, syncError: '',
+    syncFormOpen: false, syncAuthMode: 'signup', syncEmail: '', syncPending: false
   };
 
   /* ---------- dates ---------- */
@@ -666,21 +772,21 @@
   function saveJSON(key, value) {
     try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { console.error('save failed', key, e); }
   }
-  function saveSubjects() { saveJSON(STORE_KEY, state.subjects); queueDiskBackup(); }
-  function saveSettings() { saveJSON(SETTINGS_KEY, state.settings); queueDiskBackup(); }
-  function saveChecklist() { saveJSON(CHECKLIST_PREFIX + state.dateStr, state.checklist); queueDiskBackup(); }
+  function saveSubjects() { saveJSON(STORE_KEY, state.subjects); queueDiskBackup(); queueCloudSync(); }
+  function saveSettings() { saveJSON(SETTINGS_KEY, state.settings); queueDiskBackup(); queueCloudSync(); }
+  function saveChecklist() { saveJSON(CHECKLIST_PREFIX + state.dateStr, state.checklist); queueDiskBackup(); queueCloudSync(); }
   function loadChecklist(d) { return loadJSON(CHECKLIST_PREFIX + d, []); }
-  function saveChecklistFor(d, list) { if (list.length) saveJSON(CHECKLIST_PREFIX + d, list); else localStorage.removeItem(CHECKLIST_PREFIX + d); queueDiskBackup(); }
+  function saveChecklistFor(d, list) { if (list.length) saveJSON(CHECKLIST_PREFIX + d, list); else localStorage.removeItem(CHECKLIST_PREFIX + d); queueDiskBackup(); queueCloudSync(); }
   function loadBlocks(dateStr) { return loadJSON(CALENDAR_PREFIX + dateStr, []); }
-  function saveBlocks(dateStr, blocks) { if (blocks.length) saveJSON(CALENDAR_PREFIX + dateStr, blocks); else localStorage.removeItem(CALENDAR_PREFIX + dateStr); queueDiskBackup(); }
+  function saveBlocks(dateStr, blocks) { if (blocks.length) saveJSON(CALENDAR_PREFIX + dateStr, blocks); else localStorage.removeItem(CALENDAR_PREFIX + dateStr); queueDiskBackup(); queueCloudSync(); }
   function loadIcs() { return loadJSON(ICS_KEY, { name: '', importedAt: '', events: {} }); }
   function facBlocks(dateStr) { return (loadIcs().events[dateStr] || []).map(e => Object.assign({ category: 'fac', fac: true }, e)); }
 
   /* ---------- créneaux répétés ---------- */
   function loadRecurring() { return loadJSON(RECUR_KEY, []); }
-  function saveRecurring(list) { saveJSON(RECUR_KEY, list); queueDiskBackup(); }
+  function saveRecurring(list) { saveJSON(RECUR_KEY, list); queueDiskBackup(); queueCloudSync(); }
   function loadExams() { return loadJSON(EXAMS_KEY, []); }
-  function saveExams(list) { saveJSON(EXAMS_KEY, list); queueDiskBackup(); }
+  function saveExams(list) { saveJSON(EXAMS_KEY, list); queueDiskBackup(); queueCloudSync(); }
   function ruleMatches(r, dateStr) {
     if (dateStr < r.from) return false;
     if (r.until && dateStr > r.until) return false;
@@ -872,6 +978,8 @@
     html += '<div class="stat"><div class="n num">' + todo + '</div><div class="l">à étudier</div></div>';
     html += '<div class="stat gauge-stat"><div class="l"><span>ressenti global</span><b class="num">' + (gr === null ? '—' : Math.round(grPct) + ' %') + '</b></div>' + gauge(grPct, '#fff') + '</div>';
     html += '</div></header>';
+
+    if (state.syncConflict) html += renderSyncConflictBanner();
 
     html += '<nav class="tabs">';
     TABS.forEach(t => {
@@ -1464,6 +1572,18 @@
     return html;
   }
 
+  /* ---------- bannière de conflit de synchronisation ---------- */
+  function renderSyncConflictBanner() {
+    const cloud = state.syncConflict;
+    const d = new Date(cloud.updatedAt);
+    const when = d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' });
+    let html = '<div class="card sync-conflict"><div class="sync-conflict-body">';
+    html += '<div><b>Des données plus récentes existent dans le cloud</b><div class="small" style="margin-top:3px;">Modifiées le ' + when + (cloud.device ? ' depuis un ' + h(cloud.device) : '') + '. Que veux-tu faire sur cet appareil ?</div></div>';
+    html += '<div class="sync-conflict-actions"><button class="btn primary sm" data-sync-load="1">Charger ces données</button><button class="btn ghost sm" data-sync-keep="1">Garder mes données locales</button></div>';
+    html += '</div><div class="small faint" style="padding:0 16px 12px;">Une sauvegarde de ce qu\'il y a sur cet appareil sera prise automatiquement avant tout chargement.</div></div>';
+    return html;
+  }
+
   function svgText(x, y, t, opts) {
     opts = opts || {};
     return '<text x="' + x + '" y="' + y + '" font-size="' + (opts.size || 11) + '" fill="' + (opts.fill || 'var(--ink-soft)') + '" text-anchor="' + (opts.anchor || 'start') + '"' + (opts.weight ? ' font-weight="' + opts.weight + '"' : '') + '>' + h(t) + '</text>';
@@ -1767,8 +1887,42 @@
   }
 
   /* ---- protection des données ---- */
+  function renderSyncCard() {
+    let html = '<div class="card setting"><h3>Synchronisation entre appareils</h3><p>Retrouve les mêmes matières, cours, agenda et concours blancs sur ton ordinateur et ton iPad. Seules les données textuelles sont synchronisées — <b>les PDF de la bibliothèque et des papiers restent uniquement sur chaque appareil</b>.</p>';
+
+    if (!state.syncConfig) {
+      if (!state.syncFormOpen) {
+        html += '<button class="btn primary sm" data-sync-setup-open="1">Configurer la synchronisation</button>';
+      } else {
+        html += '<p class="small muted">Colle ci-dessous le bloc de configuration copié depuis la console Firebase (Paramètres du projet → Général → Tes applications → SDK).</p>';
+        html += '<textarea id="sync-config-paste" rows="6" placeholder="const firebaseConfig = { apiKey: ... };" style="width:100%; font-family:monospace; font-size:11.5px;"></textarea>';
+        html += '<div id="sync-config-error" class="error" style="display:none;"></div>';
+        html += '<div style="display:flex; gap:8px; margin-top:8px;"><button class="btn teal sm" data-sync-config-save="1">Enregistrer la configuration</button><button class="btn ghost sm" data-sync-setup-cancel="1">Annuler</button></div>';
+      }
+      return html + '</div>';
+    }
+
+    if (state.syncUser) {
+      const statusMap = { synced: ['ok', 'À jour'], syncing: ['warn', 'Synchronisation en cours…'], error: ['warn', 'Erreur de synchronisation'], conflict: ['warn', 'Décision en attente (voir en haut de page)'] };
+      const st = statusMap[state.syncStatus] || ['off', 'Statut inconnu'];
+      html += '<div class="safety-status"><span class="dot ' + st[0] + '"></span>' + h(state.syncUser) + ' · ' + st[1] + '</div>';
+      if (state.syncStatus === 'error' && state.syncError) html += '<div class="error" style="margin-bottom:8px;">' + h(state.syncError) + '</div>';
+      html += '<div style="display:flex; gap:8px; flex-wrap:wrap;"><button class="btn ghost sm" data-sync-now="1">Synchroniser maintenant</button><button class="link" data-sync-signout="1">se déconnecter</button><button class="link" data-sync-forget="1" style="color:var(--primary);">désactiver sur cet appareil</button></div>';
+    } else {
+      html += '<div class="safety-status"><span class="dot warn"></span>Configuré, mais pas connecté sur cet appareil.</div>';
+      html += '<div class="seg" style="margin-bottom:10px;"><button class="' + (state.syncAuthMode === 'signup' ? 'active' : '') + '" data-sync-mode="signup">Créer un compte</button><button class="' + (state.syncAuthMode === 'signin' ? 'active' : '') + '" data-sync-mode="signin">Se connecter</button></div>';
+      html += '<div class="field"><label>E-mail</label><input type="text" id="sync-email" autocomplete="username" style="flex:1;"></div>';
+      html += '<div class="field"><label>Mot de passe</label><input type="password" id="sync-pass" autocomplete="' + (state.syncAuthMode === 'signup' ? 'new-password' : 'current-password') + '" style="flex:1;"></div>';
+      if (state.syncAuthMode === 'signup') html += '<div class="field"><label>Confirmer</label><input type="password" id="sync-pass2" autocomplete="new-password" style="flex:1;"></div>';
+      html += '<div id="sync-auth-error" class="error" style="display:none;"></div>';
+      html += '<div style="display:flex; gap:8px; align-items:center;"><button class="btn teal sm" data-sync-submit="1" ' + (state.syncPending ? 'disabled' : '') + '>' + (state.syncAuthMode === 'signup' ? 'Créer le compte' : 'Se connecter') + '</button><button class="link" data-sync-forget="1" style="color:var(--primary);">changer de configuration</button></div>';
+    }
+    return html + '</div>';
+  }
+
   function renderDataSafety() {
     let html = '';
+    html += renderSyncCard();
     // sauvegarde sur disque
     html += '<div class="card setting"><h3>Sauvegarde automatique sur le disque</h3><p>Le plus sûr : une copie complète est écrite dans un dossier de ton ordinateur (ou un dossier Drive/iCloud synchronisé) à chaque modification. Elle survit même si le navigateur efface ses données.</p>';
     if (!fsSupported) {
@@ -2216,6 +2370,44 @@
       Object.keys(localStorage).filter(k => k.startsWith('carnet_pass_')).forEach(k => localStorage.removeItem(k));
       Promise.all([dbReq('meta', 'readwrite', st => st.clear()), dbReq('blobs', 'readwrite', st => st.clear()), dbReq('backups', 'readwrite', st => st.clear())]).catch(() => {}).then(() => { init(); toast('Carnet réinitialisé'); });
     });
+
+    /* synchronisation cloud */
+    on('[data-sync-setup-open]', 'click', () => { state.syncFormOpen = true; render(); });
+    on('[data-sync-setup-cancel]', 'click', () => { state.syncFormOpen = false; render(); });
+    on('[data-sync-config-save]', 'click', () => {
+      const err = root.querySelector('#sync-config-error');
+      const cfg = parseFirebaseConfigBlock(root.querySelector('#sync-config-paste').value);
+      if (!cfg) { err.textContent = 'Configuration illisible. Colle le bloc complet copié depuis Firebase (avec apiKey, authDomain, projectId…).'; err.style.display = 'block'; return; }
+      state.syncConfig = cfg; saveSyncConfigData(cfg); state.syncFormOpen = false; state.syncStatus = 'signed-out';
+      initFirebase(cfg).then(() => {
+        fbAuth.onAuthStateChanged(user => onSyncAuthChange(user));
+      }).catch(err2 => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(err2); render(); });
+      render(); toast('Configuration enregistrée');
+    });
+    on('[data-sync-mode]', 'click', el => { state.syncAuthMode = el.getAttribute('data-sync-mode'); render(); });
+    on('[data-sync-submit]', 'click', () => {
+      const err = root.querySelector('#sync-auth-error'); err.style.display = 'none';
+      const email = root.querySelector('#sync-email').value.trim();
+      const pass = root.querySelector('#sync-pass').value;
+      if (!email || !pass) { err.textContent = 'Renseigne l\'e-mail et le mot de passe.'; err.style.display = 'block'; return; }
+      if (state.syncAuthMode === 'signup') {
+        const pass2 = root.querySelector('#sync-pass2').value;
+        if (pass !== pass2) { err.textContent = 'Les deux mots de passe ne correspondent pas.'; err.style.display = 'block'; return; }
+      }
+      state.syncPending = true; render();
+      const action = state.syncAuthMode === 'signup' ? syncSignUp(email, pass) : syncSignIn(email, pass);
+      action.then(cred => { state.syncPending = false; onSyncAuthChange(cred.user); })
+        .catch(e => { state.syncPending = false; state.syncError = fbErrorMessage(e); render(); const e2 = root.querySelector('#sync-auth-error'); if (e2) { e2.textContent = fbErrorMessage(e); e2.style.display = 'block'; } });
+    });
+    on('[data-sync-signout]', 'click', () => { syncSignOut().then(() => { state.syncUser = null; state.syncStatus = 'signed-out'; render(); toast('Déconnecté'); }); });
+    on('[data-sync-forget]', 'click', () => {
+      if (!confirm('Désactiver la synchronisation sur cet appareil ? Tes données restent intactes ici et dans le cloud — tu pourras te reconnecter plus tard.')) return;
+      if (fbAuth) fbAuth.signOut().catch(() => {});
+      clearSyncConfigData(); state.syncConfig = null; state.syncUser = null; state.syncStatus = 'unconfigured'; state.syncFormOpen = false; render();
+    });
+    on('[data-sync-now]', 'click', () => { state.syncStatus = 'syncing'; render(); cloudPush().then(() => { render(); toast('Synchronisé'); }).catch(e => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(e); render(); }); });
+    on('[data-sync-load]', 'click', () => { resolveConflictLoad().then(() => { render(); toast('Données du cloud chargées'); }); });
+    on('[data-sync-keep]', 'click', () => { resolveConflictKeep().then(() => { render(); toast('Tes données locales ont été gardées et envoyées au cloud'); }); });
     const icsInput = root.querySelector('#ics-file');
     if (icsInput) icsInput.addEventListener('change', () => {
       const f = icsInput.files[0]; if (!f) return;
@@ -2340,6 +2532,12 @@
     state.subjects = migrate(loadJSON(STORE_KEY, null) || defaultSubjects());
     state.checklist = loadJSON(CHECKLIST_PREFIX + state.dateStr, []);
     state.exams = loadExams();
+    state.syncConfig = loadSyncConfig();
+    if (state.syncConfig) {
+      initFirebase(state.syncConfig).then(() => {
+        fbAuth.onAuthStateChanged(user => onSyncAuthChange(user));
+      }).catch(err => { state.syncStatus = 'error'; state.syncError = fbErrorMessage(err); render(); });
+    }
     state.lib.folders = libFolders(); state.lib.folderId = null; state.lib.files = []; state.papers.files = [];
     state.resetConfirmOpen = false;
     purgeOldTrash();
